@@ -1,0 +1,17 @@
+# Keil uVision 窗口布局、备份文件
+*.uvgui.*
+*.uvgui_*
+*.bak
+*.dep
+*.scvd
+JLinkLog.txt
+
+# 编译 / 链接产物
+*.obj
+*.lst
+*.m51
+*.hex
+*.lnp
+*.plg
+*.__i
+/1
