@@ -84,29 +84,17 @@ unsigned char omp_running = 0;
 unsigned char spinner_phase = 0;
 unsigned char spinner_ticks = 0;
 
-/* LED 来回扫描（参考 opencode Knight Rider 动画，全亮度近似：头灯+1颗尾迹，停留期全灭）
-   40ms/步：正向 0..7（8步）→ 停留9步 → 反向 6..0（7步）→ 停留15步，共39步 */
-#define SCANNER_PERIOD_TICKS  4
-#define SCANNER_HOLD_END      9
-#define SCANNER_HOLD_START    15
-#define SCANNER_PHASES        (8 + SCANNER_HOLD_END + 7 + SCANNER_HOLD_START)
-unsigned char scanner_phase = 0;
+/* LED 往复扫描：3 颗连灯常亮，在 8 颗 LED 上 0..5..0 连续来回运动（无暗场停留），100ms/步 */
+#define SCANNER_PERIOD_TICKS 10
+#define SCANNER_BAR_WIDTH    3
+#define SCANNER_MAX_POS      (8 - SCANNER_BAR_WIDTH)
+unsigned char scanner_pos = 0;
+unsigned char scanner_dir = 1; /* 1=正向 0=反向 */
 unsigned char scanner_ticks = 0;
 
-unsigned char LedScannerMask(unsigned char ph)
+unsigned char LedScannerMask(void)
 {
-    unsigned char pos;
-
-    if (ph < 8)
-        return (unsigned char)((0x01 << ph) | (ph ? (0x01 << (ph - 1)) : 0x00));
-    if (ph < 8 + SCANNER_HOLD_END)
-        return 0x00;
-    if (ph < 8 + SCANNER_HOLD_END + 7)
-    {
-        pos = 6 - (ph - 8 - SCANNER_HOLD_END);
-        return (unsigned char)((0x01 << pos) | (0x01 << (pos + 1)));
-    }
-    return 0x00;
+    return (unsigned char)(((1 << SCANNER_BAR_WIDTH) - 1) << scanner_pos);
 }
 
 void RenderStatus(void)
@@ -195,12 +183,13 @@ void OnUart1Rxd(void)
         omp_running = music_frame[4];
         spinner_phase = 0;
         spinner_ticks = 0;
-        scanner_phase = 0;
+        scanner_pos = 0;
+        scanner_dir = 1;
         scanner_ticks = 0;
         if (feedback_ticks == 0)
         {
             RenderStatus();
-            LedPrint(omp_running ? LedScannerMask(0) : 0x00);
+            LedPrint(omp_running ? LedScannerMask() : 0x00);
         }
     }
 }
@@ -245,9 +234,17 @@ void OnSys10mS(void)
         if (scanner_ticks >= SCANNER_PERIOD_TICKS)
         {
             scanner_ticks = 0;
-            scanner_phase++;
-            if (scanner_phase >= SCANNER_PHASES) scanner_phase = 0;
-            LedPrint(LedScannerMask(scanner_phase));
+            if (scanner_dir)
+            {
+                scanner_pos++;
+                if (scanner_pos >= SCANNER_MAX_POS) scanner_dir = 0;
+            }
+            else
+            {
+                scanner_pos--;
+                if (scanner_pos == 0) scanner_dir = 1;
+            }
+            LedPrint(LedScannerMask());
         }
     }
 
