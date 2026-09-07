@@ -203,7 +203,7 @@
       <TopLine>0</TopLine>
       <CurrentLine>0</CurrentLine>
       <bDave2>0</bDave2>
-      <PathWithFileName>..\STCBSP_V3.6.LIB</PathWithFileName>
+      <PathWithFileName>deps\STCBSP_V3.6.LIB</PathWithFileName>
       <FilenameWithoutPath>STCBSP_V3.6.LIB</FilenameWithoutPath>
       <RteFlg>0</RteFlg>
       <bShared>0</bShared>

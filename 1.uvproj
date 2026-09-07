@@ -298,7 +298,7 @@
               <MiscControls></MiscControls>
               <Define></Define>
               <Undefine></Undefine>
-              <IncludePath>..\inc</IncludePath>
+              <IncludePath>deps\inc</IncludePath>
             </VariousControls>
           </C51>
           <Ax51>
@@ -363,7 +363,7 @@
             <File>
               <FileName>STCBSP_V3.6.LIB</FileName>
               <FileType>4</FileType>
-              <FilePath>..\STCBSP_V3.6.LIB</FilePath>
+              <FilePath>deps\STCBSP_V3.6.LIB</FilePath>
             </File>
           </Files>
         </Group>
