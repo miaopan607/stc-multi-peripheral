@@ -104,9 +104,13 @@ unsigned char LedScannerMask(void)
    源表 -11 与 -87 之间的 -4.7 按单调性修正为 -47 */
 #define GLYPH_MINUS 12
 #define GLYPH_DP0   36
-int temp_value = 0;              /* 0.1°C，如 253 = 25.3°C */
+int temp_value = 0;              /* 显示值：30s 平均（0.1°C，如 253 = 25.3°C） */
 unsigned int temp_sum = 0;
 unsigned char temp_i = 0;
+long temp_acc = 0;               /* 30s 窗口累加（0.1°C） */
+unsigned int temp_n = 0;         /* 窗口内样本数 */
+unsigned char temp_have_avg = 0; /* 首个窗口未满前跟随原始值，保证上电即有显示 */
+#define TEMP_WINDOW_SAMPLES 188  /* 188 × ~160ms ≈ 30s */
 
 int rt_to_tem(unsigned int adc, unsigned char adcbit)
 {
@@ -127,14 +131,25 @@ void FillTempGlyphs(unsigned char *g)
 {
     int t = temp_value;
     unsigned int tt;
+    unsigned char buf[4];
+    unsigned char n = 0;
+    unsigned char intpart, h, tens, ones, i;
 
-    /* 温度四位字形（负值显示'-'，≥100°C 时百位借 g[0]） */
-    if (t < 0) { g[0] = GLYPH_MINUS; tt = -t; }
-    else if (t >= 1000) { g[0] = (unsigned char)(t / 1000); tt = (unsigned int)t; }
-    else { g[0] = 10; tt = (unsigned int)t; }
-    if (tt >= 100) g[1] = (unsigned char)(tt / 100 % 10); else g[1] = 10;
-    g[2] = (unsigned char)(GLYPH_DP0 + tt / 10 % 10);
-    g[3] = (unsigned char)(tt % 10);
+    /* 温度字形紧凑左对齐：正常两位室温占 d0..d2；出现符号或
+       三位整数（≥100°C / 负温）时自然多占一格（即"移回来"） */
+    if (t < 0) { buf[n++] = GLYPH_MINUS; tt = (unsigned int)(-t); }
+    else tt = (unsigned int)t;
+
+    intpart = (unsigned char)(tt / 10); /* 整数部分，最高 200 */
+    h = intpart / 100;
+    tens = intpart / 10 % 10;
+    ones = intpart % 10;
+    if (h != 0) buf[n++] = h;
+    if (intpart >= 10) buf[n++] = tens;
+    buf[n++] = (unsigned char)(GLYPH_DP0 + ones); /* 个位带小数点 */
+    buf[n++] = (unsigned char)(tt % 10);          /* 十分位 */
+
+    for (i = 0; i < 4; i++) g[i] = (i < n) ? buf[i] : 10;
 }
 
 void RenderStatus(void)
@@ -303,7 +318,8 @@ void OnSys10mS(void)
         }
     }
 
-    /* 温度采样：16次 Rt 求和（10bit→14bit）换算一次，约160mS 刷新 */
+    /* 温度采样：16次 Rt 求和（10bit→14bit）得原始值（~160mS），
+       累加进 30s 窗口；窗口满才更新显示值（近30s平均） */
     adcres = GetADC();
     if (temp_i < 15)
     {
@@ -312,11 +328,26 @@ void OnSys10mS(void)
     }
     else
     {
-        temp_value = rt_to_tem(temp_sum, 14);
+        unsigned char temp_dirty = 0;
+
+        temp_acc += rt_to_tem(temp_sum, 14);
         temp_i = 0;
         temp_sum = adcres.Rt;
-        /* 状态模式或空闲（音乐已超时）时刷新显示；音乐模式下高4位被律动条占用 */
-        if (feedback_ticks == 0)
+        temp_n++;
+        if (!temp_have_avg)
+        {
+            temp_value = (int)(temp_acc / temp_n);
+            temp_dirty = 1;
+        }
+        if (temp_n >= TEMP_WINDOW_SAMPLES)
+        {
+            temp_value = (int)(temp_acc / temp_n);
+            temp_acc = 0;
+            temp_n = 0;
+            temp_have_avg = 1;
+            temp_dirty = 1;
+        }
+        if ((temp_dirty) && (feedback_ticks == 0))
         {
             if (disp_mode == MODE_STATUS) RenderStatus();
             else if (music_fresh_ticks >= MUSIC_TIMEOUT_TICKS) RenderIdle();
