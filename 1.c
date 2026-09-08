@@ -4,6 +4,7 @@
 #include "uart1.h"
 #include "adc.h"
 #include "Key.H"
+#include "Beep.H"
 
 code unsigned long SysClock = 11059200;
 
@@ -37,6 +38,20 @@ code char decode_table[] = {
    status: 0=空闲(显示Stop) 1=工作中(显示run，第8位转圈，LED来回扫描) */
 #define STATUS_FRAME_LEN 6
 #define STATUS_FRAME_TYPE 0x22
+
+/* 提醒音帧：AA 5A 23 0 tune chk，chk = 0x23 ^ 0 ^ tune（字节3保留0，字节4为曲调号）
+   tune: 1=C4-E4-G4-C5 上行琶音（任务完成/需手动操作提醒），每音 250ms */
+#define TUNE_FRAME_LEN 6
+#define TUNE_FRAME_TYPE 0x23
+#define TUNE_ID_REMIND 1
+
+#define NOTE_COUNT 4
+#define NOTE_TICKS 25 /* SetBeep 时长=10×tick，25→250ms，与 10ms 系统节拍一致 */
+code unsigned int remind_notes[NOTE_COUNT] = {262, 330, 392, 523}; /* C4 E4 G4 C5 */
+unsigned char tune_playing = 0;
+unsigned char tune_note = 0;
+unsigned char tune_need_sound = 0;
+unsigned char tune_ticks = 0;
 
 #define KEY_NONE   0
 #define KEY_UP     1
@@ -259,11 +274,45 @@ void OnUart1Rxd(void)
             LedPrint(omp_running ? LedScannerMask() : 0x00);
         }
     }
+    else if ((music_frame[2] == TUNE_FRAME_TYPE) &&
+             (music_frame[3] == 0) &&
+             (music_frame[4] == TUNE_ID_REMIND) &&
+             (music_frame[5] == checksum))
+    {
+        /* 触发一次提醒音，不改变显示模式 */
+        tune_playing = 1;
+        tune_note = 0;
+        tune_need_sound = 1;
+        tune_ticks = 0;
+    }
 }
 
 void OnSys10mS(void)
 {
     struct_ADC adcres;
+
+    /* 提醒音序列：非阻塞，每音 250ms；上一音未结束(SetBeep 忙)时下个节拍重试 */
+    if (tune_playing)
+    {
+        if (tune_need_sound)
+        {
+            if (SetBeep(remind_notes[tune_note], NOTE_TICKS) == enumSetBeepOK)
+            {
+                tune_need_sound = 0;
+                tune_ticks = NOTE_TICKS;
+            }
+        }
+        else
+        {
+            if (tune_ticks != 0) tune_ticks--;
+            if (tune_ticks == 0)
+            {
+                tune_note++;
+                if (tune_note >= NOTE_COUNT) tune_playing = 0;
+                else tune_need_sound = 1;
+            }
+        }
+    }
 
     if (music_fresh_ticks < MUSIC_TIMEOUT_TICKS)
     {
@@ -420,6 +469,7 @@ void main(void)
 
     AdcInit(ADCexpEXT);
     KeyInit();
+    BeepInit();
 
     MySTC_Init();
     SetEventCallBack(enumEventUart1Rxd, OnUart1Rxd);
