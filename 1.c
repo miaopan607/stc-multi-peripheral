@@ -14,11 +14,14 @@ code char decode_table[] = {
     0x76, 0x38,
     0x3e, 0x5e, 0x79, 0x39, 0x58, 0x78, 0x6d,
     0x50, 0x54, 0x5c, 0x73, 0x1c,
-    0x01, 0x02, 0x04, 0x08, 0x10, 0x20
+    0x01, 0x02, 0x04, 0x08, 0x10, 0x20,
+    0x3f|0x80, 0x06|0x80, 0x5b|0x80, 0x4f|0x80, 0x66|0x80,
+    0x6d|0x80, 0x7d|0x80, 0x07|0x80, 0x7f|0x80, 0x6f|0x80
 };
 #endif
 /* 追加字形：18=U 19=d 20=E 21=C 22=c 23=t 24=S
-   25=r 26=n 27=o 28=P 29=u 30..35=单段a/b/c/d/e/f（第8位转圈动画用） */
+   25=r 26=n 27=o 28=P 29=u 30..35=单段a/b/c/d/e/f（第8位转圈动画用）
+   36..45=带小数点的0..9（温度显示用） */
 
 #define MUSIC_FRAME_LEN 6
 #define MUSIC_FRAME_TYPE 0x20
@@ -97,13 +100,62 @@ unsigned char LedScannerMask(void)
     return (unsigned char)(((1 << SCANNER_BAR_WIDTH) - 1) << scanner_pos);
 }
 
+/* 温度：板载 10K/3950 NTC（Rt 通道），官方 BSP 例程换算表（0.1°C 单位，查表+线性插值）
+   源表 -11 与 -87 之间的 -4.7 按单调性修正为 -47 */
+#define GLYPH_MINUS 12
+#define GLYPH_DP0   36
+int temp_value = 0;              /* 0.1°C，如 253 = 25.3°C */
+unsigned int temp_sum = 0;
+unsigned char temp_i = 0;
+
+int rt_to_tem(unsigned int adc, unsigned char adcbit)
+{
+    code int temtable[32] = {2000, 1293, 1016, 866, 763, 685, 621, 567, 520, 477, 439, 403, 370, 338, 308, 278, 250, 222, 194, 167, 139, 111, 83, 53, 22, -11, -47, -87, -132, -186, -256, -364};
+    unsigned char resh;
+    unsigned int resl;
+    long diff;
+
+    resl = adc << (16 - adcbit);
+    resh = resl >> 11;
+    resl = resl & 0x07ff;
+    /* 官方例程此处为16位乘法，diff*resl 最大约 1.45M 会回绕，改用 long */
+    diff = (long)(temtable[resh] - temtable[resh + 1]);
+    return (int)(temtable[resh] - (int)((diff * resl) >> 11));
+}
+
+void FillTempGlyphs(unsigned char *g)
+{
+    int t = temp_value;
+    unsigned int tt;
+
+    /* 温度四位字形（负值显示'-'，≥100°C 时百位借 g[0]） */
+    if (t < 0) { g[0] = GLYPH_MINUS; tt = -t; }
+    else if (t >= 1000) { g[0] = (unsigned char)(t / 1000); tt = (unsigned int)t; }
+    else { g[0] = 10; tt = (unsigned int)t; }
+    if (tt >= 100) g[1] = (unsigned char)(tt / 100 % 10); else g[1] = 10;
+    g[2] = (unsigned char)(GLYPH_DP0 + tt / 10 % 10);
+    g[3] = (unsigned char)(tt % 10);
+}
+
 void RenderStatus(void)
 {
+    unsigned char g[4];
+
+    FillTempGlyphs(g);
     if (omp_running)
-        Seg7Print(10, 10, 10, 10, GLYPH_R, GLYPH_U, GLYPH_N,
+        Seg7Print(g[0], g[1], g[2], g[3], GLYPH_R, GLYPH_U, GLYPH_N,
                   GLYPH_SPIN_A + spinner_phase);
     else
-        Seg7Print(10, 10, 10, 10, 24, 23, GLYPH_O, GLYPH_P); /* Stop */
+        Seg7Print(g[0], g[1], g[2], g[3], 24, 23, GLYPH_O, GLYPH_P); /* Stop */
+}
+
+/* 空闲（无音乐帧且未接 omp）：高4位显示温度，低4位熄灭 */
+void RenderIdle(void)
+{
+    unsigned char g[4];
+
+    FillTempGlyphs(g);
+    Seg7Print(g[0], g[1], g[2], g[3], 10, 10, 10, 10);
 }
 
 void RenderBars(unsigned char bars)
@@ -196,6 +248,8 @@ void OnUart1Rxd(void)
 
 void OnSys10mS(void)
 {
+    struct_ADC adcres;
+
     if (music_fresh_ticks < MUSIC_TIMEOUT_TICKS)
     {
         music_fresh_ticks++;
@@ -204,7 +258,7 @@ void OnSys10mS(void)
         {
             music_timeout_rendered = 1;
             music_bars = 0;
-            if ((feedback_ticks == 0) && (disp_mode == MODE_MUSIC)) RenderBars(0);
+            if ((feedback_ticks == 0) && (disp_mode == MODE_MUSIC)) RenderIdle();
         }
     }
 
@@ -215,7 +269,8 @@ void OnSys10mS(void)
         {
             LedPrint(0x00);
             if (disp_mode == MODE_STATUS) RenderStatus();
-            else RenderBars(music_bars);
+            else if (music_fresh_ticks < MUSIC_TIMEOUT_TICKS) RenderBars(music_bars);
+            else RenderIdle();
         }
     }
 
@@ -245,6 +300,26 @@ void OnSys10mS(void)
                 if (scanner_pos == 0) scanner_dir = 1;
             }
             LedPrint(LedScannerMask());
+        }
+    }
+
+    /* 温度采样：16次 Rt 求和（10bit→14bit）换算一次，约160mS 刷新 */
+    adcres = GetADC();
+    if (temp_i < 15)
+    {
+        temp_sum += adcres.Rt;
+        temp_i++;
+    }
+    else
+    {
+        temp_value = rt_to_tem(temp_sum, 14);
+        temp_i = 0;
+        temp_sum = adcres.Rt;
+        /* 状态模式或空闲（音乐已超时）时刷新显示；音乐模式下高4位被律动条占用 */
+        if (feedback_ticks == 0)
+        {
+            if (disp_mode == MODE_STATUS) RenderStatus();
+            else if (music_fresh_ticks >= MUSIC_TIMEOUT_TICKS) RenderIdle();
         }
     }
 
@@ -307,7 +382,7 @@ void main(void)
 {
     DisplayerInit();
     SetDisplayerArea(0, 7);
-    RenderBars(0);
+    RenderIdle(); /* 上电无音乐帧，直接进空闲温度显示 */
 
     Uart1Init(115200);
     SetUart1Rxd(music_frame, MUSIC_FRAME_LEN, music_header, 2);
