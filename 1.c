@@ -17,16 +17,22 @@ code char decode_table[] = {
     0x50, 0x54, 0x5c, 0x73, 0x1c,
     0x01, 0x02, 0x04, 0x08, 0x10, 0x20,
     0x3f|0x80, 0x06|0x80, 0x5b|0x80, 0x4f|0x80, 0x66|0x80,
-    0x6d|0x80, 0x7d|0x80, 0x07|0x80, 0x7f|0x80, 0x6f|0x80
+    0x6d|0x80, 0x7d|0x80, 0x07|0x80, 0x7f|0x80, 0x6f|0x80,
+    0x63, 0x1c
 };
 #endif
 /* 追加字形：18=U 19=d 20=E 21=C 22=c 23=t 24=S
    25=r 26=n 27=o 28=P 29=u 30..35=单段a/b/c/d/e/f（第8位转圈动画用）
-   36..45=带小数点的0..9（温度显示用） */
+   36..45=带小数点的0..9（温度显示用）
+   46=上半段a/b/f/g 47=下半段c/d/e（双声道律动用） */
 
 #define MUSIC_FRAME_LEN 6
 #define MUSIC_FRAME_TYPE 0x20
 #define MUSIC_TIMEOUT_TICKS 50
+
+/* 双声道音乐帧：AA 5A 26 L R chk，chk = 0x26 ^ L ^ R（L/R=左右声道电平 0..8）
+   每位数码管拆上下半段：上半段亮=左声道，下半段亮=右声道，上下都亮=整字 */
+#define STEREO_FRAME_TYPE 0x26
 
 /* 按键帧：AA 5A 21 key action chk，chk = 0x21 ^ key ^ action
    key: 1=上 2=下 3=左(Backspace) 4=右(/) 5=中键(Enter) 6=K1(Ctrl+C) 7=K2(Tab) 8=K3(Esc)
@@ -103,6 +109,9 @@ unsigned char tune_ticks = 0;
 unsigned char music_frame[MUSIC_FRAME_LEN];
 unsigned char music_header[2] = {0xAA, 0x5A};
 unsigned char music_bars = 0;
+unsigned char music_left = 0;
+unsigned char music_right = 0;
+unsigned char music_stereo = 0; /* 最近一帧音乐数据是否为双声道（0x26） */
 unsigned char music_fresh_ticks = MUSIC_TIMEOUT_TICKS;
 unsigned char music_timeout_rendered = 1;
 
@@ -238,6 +247,27 @@ void RenderBars(unsigned char bars)
     if (bars > 6) d6 = 8;
     if (bars > 7) d7 = 8;
     Seg7Print(d0, d1, d2, d3, d4, d5, d6, d7);
+}
+
+#define GLYPH_BAR_TOP    46
+#define GLYPH_BAR_BOTTOM 47
+
+/* 双声道律动：第 i 位上/下半段按声道电平独立点亮，两级都亮则显示整字 8 */
+void RenderBarsStereo(unsigned char left, unsigned char right)
+{
+    unsigned char g[8];
+    unsigned char i;
+
+    if (left > 8) left = 8;
+    if (right > 8) right = 8;
+    for (i = 0; i < 8; i++)
+    {
+        if ((left > i) && (right > i)) g[i] = 8;
+        else if (left > i) g[i] = GLYPH_BAR_TOP;
+        else if (right > i) g[i] = GLYPH_BAR_BOTTOM;
+        else g[i] = 10;
+    }
+    Seg7Print(g[0], g[1], g[2], g[3], g[4], g[5], g[6], g[7]);
 }
 
 void SendKeyFrame(unsigned char key, unsigned char action)
@@ -417,9 +447,28 @@ void OnUart1Rxd(void)
             LedPrint(0x00);
         }
         music_bars = music_frame[4];
+        music_stereo = 0;
         music_fresh_ticks = 0;
         music_timeout_rendered = 0;
         if (feedback_ticks == 0) RenderBars(music_bars);
+    }
+    else if ((pin_mode == 0) &&
+             (music_frame[2] == STEREO_FRAME_TYPE) &&
+             (music_frame[3] <= 8) &&
+             (music_frame[4] <= 8) &&
+             (music_frame[5] == checksum))
+    {
+        if (disp_mode != MODE_MUSIC)
+        {
+            disp_mode = MODE_MUSIC;
+            LedPrint(0x00);
+        }
+        music_stereo = 1;
+        music_left = music_frame[3];
+        music_right = music_frame[4];
+        music_fresh_ticks = 0;
+        music_timeout_rendered = 0;
+        if (feedback_ticks == 0) RenderBarsStereo(music_left, music_right);
     }
     else if ((pin_mode == 0) &&
              (music_frame[2] == STATUS_FRAME_TYPE) &&
@@ -515,6 +564,8 @@ void OnSys10mS(void)
         {
             music_timeout_rendered = 1;
             music_bars = 0;
+            music_left = 0;
+            music_right = 0;
             if ((feedback_ticks == 0) && (disp_mode == MODE_MUSIC) && (pin_mode == 0)) RenderIdle();
         }
     }
@@ -540,7 +591,11 @@ void OnSys10mS(void)
         {
             LedPrint(0x00);
             if (disp_mode == MODE_STATUS) RenderStatus();
-            else if (music_fresh_ticks < MUSIC_TIMEOUT_TICKS) RenderBars(music_bars);
+            else if (music_fresh_ticks < MUSIC_TIMEOUT_TICKS)
+            {
+                if (music_stereo) RenderBarsStereo(music_left, music_right);
+                else RenderBars(music_bars);
+            }
             else RenderIdle();
         }
     }
