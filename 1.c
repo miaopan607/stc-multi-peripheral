@@ -45,6 +45,35 @@ code char decode_table[] = {
 #define TUNE_FRAME_TYPE 0x23
 #define TUNE_ID_REMIND 1
 
+/* SafeKey 帧（上位机保险箱的硬件 PIN 认证，参考 icecat897/SafeKey-STC-B 整合）：
+   0x24 主机→板子：AA 5A 24 0 cmd chk，chk = 0x24 ^ 0 ^ cmd；cmd 1=进入PIN输入模式 0=退出
+   0x25 板子→主机：AA 5A 25 ev payload chk，chk = 0x25 ^ ev ^ payload
+   ev: 1=认证成功 2=认证失败(payload=已失败次数) 3=进入锁定(payload=30秒)
+       4=输入进度(payload=已确认位数) 5=退出PIN模式
+   PIN 模式下 K1=当前位数字+1 K2=确认进入下一位(第6位确认即本地校验) K3=回退一位，
+   按键由板内消费、不转发按键帧；PIN 模式期间忽略音乐/状态/提醒音帧 */
+#define SAFEKEY_FRAME_TYPE  0x24
+#define SKAUTH_FRAME_TYPE   0x25
+#define SK_EV_OK    1
+#define SK_EV_FAIL  2
+#define SK_EV_LOCK  3
+#define SK_EV_INPUT 4
+#define SK_EV_EXIT  5
+
+#define PIN_LEN        6
+#define PIN_MAX_FAIL   3
+#define PIN_LOCK_TICKS 3000 /* 10ms 节拍 × 3000 = 30s */
+/* 板上固定 PIN，存数字而非 ASCII（如需更换改此处后重新编译烧录） */
+code unsigned char pin_code[PIN_LEN] = {1, 2, 3, 4, 5, 6};
+unsigned char pin_mode = 0;
+unsigned char pin_buf[PIN_LEN];
+unsigned char pin_pos = 0;
+unsigned char pin_digit = 0;
+unsigned char pin_fails = 0;
+unsigned char pin_locked = 0;
+unsigned int pin_lock_ticks = 0;
+unsigned char sk_tx[6];
+
 #define NOTE_COUNT 4
 #define NOTE_TICKS 25 /* SetBeep 时长=10×tick，25→250ms，与 10ms 系统节拍一致 */
 code unsigned int remind_notes[NOTE_COUNT] = {262, 330, 392, 523}; /* C4 E4 G4 C5 */
@@ -219,6 +248,141 @@ void SendKeyFrame(unsigned char key, unsigned char action)
     Uart1Print(key_frame, KEY_FRAME_LEN);
 }
 
+/* ---------------- SafeKey PIN 认证 ---------------- */
+
+void SkSend(unsigned char ev, unsigned char payload)
+{
+    sk_tx[0] = 0xAA;
+    sk_tx[1] = 0x5A;
+    sk_tx[2] = SKAUTH_FRAME_TYPE;
+    sk_tx[3] = ev;
+    sk_tx[4] = payload;
+    sk_tx[5] = SKAUTH_FRAME_TYPE ^ ev ^ payload;
+    Uart1Print(sk_tx, 6);
+}
+
+/* 输入显示：d0..d5=已确认位（未确认处熄灭，当前编辑位实时显示正在输入的数字），
+   d6=已确认位数 d7=当前编辑数字 */
+void SkShow(void)
+{
+    unsigned char d0 = 10, d1 = 10, d2 = 10, d3 = 10, d4 = 10, d5 = 10;
+
+    if (pin_pos > 0) d0 = pin_buf[0];
+    if (pin_pos > 1) d1 = pin_buf[1];
+    if (pin_pos > 2) d2 = pin_buf[2];
+    if (pin_pos > 3) d3 = pin_buf[3];
+    if (pin_pos > 4) d4 = pin_buf[4];
+    if (pin_pos == 0) d0 = pin_digit;
+    else if (pin_pos == 1) d1 = pin_digit;
+    else if (pin_pos == 2) d2 = pin_digit;
+    else if (pin_pos == 3) d3 = pin_digit;
+    else if (pin_pos == 4) d4 = pin_digit;
+    else d5 = pin_digit;
+    Seg7Print(d0, d1, d2, d3, d4, d5, pin_pos, pin_digit);
+}
+
+/* 锁定倒计时：低两位显示剩余秒数 */
+void SkShowLock(void)
+{
+    unsigned char sec = (unsigned char)(pin_lock_ticks / 100);
+
+    Seg7Print(10, 10, 10, 10, 10, 10, sec / 10, sec % 10);
+}
+
+void SkClear(void)
+{
+    unsigned char i;
+
+    for (i = 0; i < PIN_LEN; i++) pin_buf[i] = 0;
+    pin_pos = 0;
+    pin_digit = 0;
+    SkShow();
+}
+
+void SkSuccess(void)
+{
+    pin_locked = 0;
+    pin_fails = 0;
+    LedPrint(0xFF);
+    SetBeep(1800, 12); /* 120ms 长鸣 */
+    SkSend(SK_EV_OK, 0);
+    Seg7Print(10, 10, 10, 10, 10, 10, 10, 10);
+}
+
+void SkFail(void)
+{
+    pin_fails++;
+    LedPrint(0x00);
+    SetBeep(500, 22); /* 220ms 低鸣 */
+    SkSend(SK_EV_FAIL, pin_fails);
+    if (pin_fails >= PIN_MAX_FAIL)
+    {
+        pin_locked = 1;
+        pin_lock_ticks = PIN_LOCK_TICKS;
+        LedPrint(0x81);
+        SkSend(SK_EV_LOCK, 30);
+    }
+    SkClear();
+}
+
+void SkCheck(void)
+{
+    unsigned char i;
+
+    for (i = 0; i < PIN_LEN; i++)
+    {
+        if (pin_buf[i] != pin_code[i])
+        {
+            SkFail();
+            return;
+        }
+    }
+    SkSuccess();
+}
+
+/* PIN 模式下的 K1/K2/K3：由板内消费，不转发按键帧 */
+void SkKey(unsigned char key)
+{
+    if (!pin_mode) return;
+    if (pin_locked) return;
+    if (key == KEY_K1)
+    {
+        pin_digit++;
+        if (pin_digit > 9) pin_digit = 0;
+        SetBeep(1200, 3);
+        SkShow();
+    }
+    else if (key == KEY_K2)
+    {
+        pin_buf[pin_pos] = pin_digit;
+        pin_pos++;
+        pin_digit = 0;
+        SetBeep(1400, 3);
+        if (pin_pos >= PIN_LEN) SkCheck();
+        else
+        {
+            SkShow();
+            SkSend(SK_EV_INPUT, pin_pos);
+        }
+    }
+    else /* KEY_K3 回退一位；第 0 位时只把当前数字归零 */
+    {
+        if (pin_pos > 0)
+        {
+            pin_pos--;
+            pin_digit = pin_buf[pin_pos];
+            pin_buf[pin_pos] = 0;
+        }
+        else
+        {
+            pin_digit = 0;
+        }
+        SetBeep(800, 5);
+        SkShow();
+        SkSend(SK_EV_INPUT, pin_pos);
+    }
+}
+
 void FlashKeyGlyph(unsigned char glyph)
 {
     Seg7Print(glyph, 10, 10, 10, 10, 10, 10, 10);
@@ -242,7 +406,8 @@ void OnUart1Rxd(void)
     unsigned char checksum;
 
     checksum = music_frame[2] ^ music_frame[3] ^ music_frame[4];
-    if ((music_frame[2] == MUSIC_FRAME_TYPE) &&
+    if ((pin_mode == 0) &&
+        (music_frame[2] == MUSIC_FRAME_TYPE) &&
         (music_frame[4] <= 8) &&
         (music_frame[5] == checksum))
     {
@@ -256,7 +421,8 @@ void OnUart1Rxd(void)
         music_timeout_rendered = 0;
         if (feedback_ticks == 0) RenderBars(music_bars);
     }
-    else if ((music_frame[2] == STATUS_FRAME_TYPE) &&
+    else if ((pin_mode == 0) &&
+             (music_frame[2] == STATUS_FRAME_TYPE) &&
              (music_frame[3] == 0) &&
              (music_frame[4] <= 1) &&
              (music_frame[5] == checksum))
@@ -279,11 +445,38 @@ void OnUart1Rxd(void)
              (music_frame[4] == TUNE_ID_REMIND) &&
              (music_frame[5] == checksum))
     {
-        /* 触发一次提醒音，不改变显示模式 */
-        tune_playing = 1;
-        tune_note = 0;
-        tune_need_sound = 1;
-        tune_ticks = 0;
+        /* 触发一次提醒音，不改变显示模式；PIN 模式下忽略以免与输入音冲突 */
+        if (pin_mode == 0)
+        {
+            tune_playing = 1;
+            tune_note = 0;
+            tune_need_sound = 1;
+            tune_ticks = 0;
+        }
+    }
+    else if ((music_frame[2] == SAFEKEY_FRAME_TYPE) &&
+             (music_frame[3] == 0) &&
+             (music_frame[4] <= 1) &&
+             (music_frame[5] == checksum))
+    {
+        if (music_frame[4])
+        {
+            /* 进入 PIN 模式：接管显示与 K1/K2/K3，丢弃未完成的按键反馈闪烁 */
+            pin_mode = 1;
+            pin_locked = 0;
+            pin_fails = 0;
+            feedback_ticks = 0;
+            tune_playing = 0;
+            LedPrint(0x18);
+            SkClear();
+        }
+        else
+        {
+            pin_mode = 0;
+            LedPrint(0x00);
+            RenderIdle();
+            SkSend(SK_EV_EXIT, 0);
+        }
     }
 }
 
@@ -322,7 +515,21 @@ void OnSys10mS(void)
         {
             music_timeout_rendered = 1;
             music_bars = 0;
-            if ((feedback_ticks == 0) && (disp_mode == MODE_MUSIC)) RenderIdle();
+            if ((feedback_ticks == 0) && (disp_mode == MODE_MUSIC) && (pin_mode == 0)) RenderIdle();
+        }
+    }
+
+    /* SafeKey 锁定倒计时：每秒刷新剩余秒数，归零后恢复输入 */
+    if ((pin_mode) && (pin_locked) && (pin_lock_ticks != 0))
+    {
+        pin_lock_ticks--;
+        if ((pin_lock_ticks % 100) == 0) SkShowLock();
+        if (pin_lock_ticks == 0)
+        {
+            pin_locked = 0;
+            pin_fails = 0;
+            LedPrint(0x18);
+            SkClear();
         }
     }
 
@@ -338,7 +545,7 @@ void OnSys10mS(void)
         }
     }
 
-    if ((disp_mode == MODE_STATUS) && (omp_running) && (feedback_ticks == 0))
+    if ((disp_mode == MODE_STATUS) && (omp_running) && (feedback_ticks == 0) && (pin_mode == 0))
     {
         spinner_ticks++;
         if (spinner_ticks >= SPINNER_PERIOD_TICKS)
@@ -396,7 +603,7 @@ void OnSys10mS(void)
             temp_have_avg = 1;
             temp_dirty = 1;
         }
-        if ((temp_dirty) && (feedback_ticks == 0))
+        if ((temp_dirty) && (feedback_ticks == 0) && (pin_mode == 0))
         {
             if (disp_mode == MODE_STATUS) RenderStatus();
             else if (music_fresh_ticks >= MUSIC_TIMEOUT_TICKS) RenderIdle();
@@ -444,7 +651,11 @@ void OnNav(void)
     if (act == enumKeyPress) SendKey(KEY_CENTER);
 
     act = GetAdcNavAct(enumAdcNavKey3);
-    if (act == enumKeyPress) SendKey(KEY_K3);
+    if (act == enumKeyPress)
+    {
+        if (pin_mode) SkKey(KEY_K3);
+        else SendKey(KEY_K3);
+    }
 }
 
 void OnKey(void)
@@ -452,10 +663,18 @@ void OnKey(void)
     unsigned char act;
 
     act = GetKeyAct(enumKey1);
-    if (act == enumKeyPress) SendKey(KEY_K1);
+    if (act == enumKeyPress)
+    {
+        if (pin_mode) SkKey(KEY_K1);
+        else SendKey(KEY_K1);
+    }
 
     act = GetKeyAct(enumKey2);
-    if (act == enumKeyPress) SendKey(KEY_K2);
+    if (act == enumKeyPress)
+    {
+        if (pin_mode) SkKey(KEY_K2);
+        else SendKey(KEY_K2);
+    }
 }
 
 void main(void)
